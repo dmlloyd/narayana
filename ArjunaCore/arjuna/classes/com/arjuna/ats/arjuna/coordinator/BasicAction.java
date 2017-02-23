@@ -39,6 +39,7 @@ import java.util.Hashtable;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import com.arjuna.ats.arjuna.ObjectType;
 import com.arjuna.ats.arjuna.StateManager;
@@ -259,8 +260,19 @@ public class BasicAction extends StateManager
                 * If we are active then change status. Otherwise it may be an error so check status.
                 */
 
-            if (actionStatus == ActionStatus.RUNNING)
-                actionStatus = ActionStatus.ABORT_ONLY;
+            /*
+             * The only change we can safely do outside of the lock is RUNNING -> ABORT_ONLY,
+             * but it must be atomic to be safe.
+             */
+            int actionStatus, newActionStatus;
+            do {
+                actionStatus = this.actionStatus;
+                if (actionStatus == ActionStatus.RUNNING) {
+                    newActionStatus = ActionStatus.ABORT_ONLY;
+                } else {
+                    break;
+                }
+            } while (! actionStatusUpdater.compareAndSet(this, actionStatus, newActionStatus));
 
             /*
                 * Since the reason to call this method is to make sure the transaction
@@ -1633,6 +1645,7 @@ public class BasicAction extends StateManager
 
         /* Check for superfluous invocation */
 
+        int actionStatus = this.actionStatus;
         if ((actionStatus != ActionStatus.RUNNING)
                 && (actionStatus != ActionStatus.ABORT_ONLY)
                 && (actionStatus != ActionStatus.COMMITTING)) {
@@ -1666,7 +1679,7 @@ public class BasicAction extends StateManager
 
         if (pendingList != null)
         {
-            actionStatus = ActionStatus.ABORTING;
+            this.actionStatus = ActionStatus.ABORTING;
 
             while (pendingList.size() > 0)
                 doAbort(pendingList, false); // turn off heuristics reporting
@@ -1682,7 +1695,7 @@ public class BasicAction extends StateManager
 
         ActionManager.manager().remove(get_uid());
 
-        actionStatus = ActionStatus.ABORTED;
+        this.actionStatus = ActionStatus.ABORTED;
 
         if (TxStats.enabled()) {
             TxStats.getInstance().incrementAbortedTransactions();
@@ -1691,7 +1704,7 @@ public class BasicAction extends StateManager
                 TxStats.getInstance().incrementApplicationRollbacks();
         }
 
-        return actionStatus;
+        return this.actionStatus;
     }
 
     /**
@@ -2091,16 +2104,27 @@ public class BasicAction extends StateManager
                     + get_uid());
         }
 
-        boolean commitAllowed = (actionStatus != ActionStatus.ABORT_ONLY);
-
-        actionStatus = ActionStatus.PREPARING;
+        /*
+         * Atomically determine whether commit is allowed, while also updating the status to PREPARING;
+         * this is necessary because the actionStatus could change to ABORT_ONLY in the window between
+         * when the action status is read and when it is updated to PREPARING, which causes setRollbackOnly()
+         * to succeed yet the transaction prepares.
+         *
+         * Once we've set it to PREPARING, any possible further mutation is under the instance lock and thus is safe.
+         */
+        boolean commitAllowed;
+        int actionStatus;
+        do {
+            actionStatus = this.actionStatus;
+            commitAllowed = actionStatus != ActionStatus.ABORT_ONLY;
+        } while (! actionStatusUpdater.compareAndSet(this, actionStatus, ActionStatus.PREPARING));
 
         /* If we cannot commit - say the prepare failed */
 
         if (!commitAllowed) {
             tsLogger.i18NLogger.warn_coordinator_BasicAction_43(get_uid());
 
-            actionStatus = ActionStatus.PREPARED;
+            this.actionStatus = ActionStatus.PREPARED;
 
             return TwoPhaseOutcome.PREPARE_NOTOK;
         }
@@ -2113,7 +2137,7 @@ public class BasicAction extends StateManager
         {
             if (getStore() == null)
             {
-                actionStatus = ActionStatus.ABORT_ONLY;
+                this.actionStatus = ActionStatus.ABORT_ONLY;
                 internalError = true;
                 return TwoPhaseOutcome.PREPARE_NOTOK;
             }
@@ -2273,9 +2297,9 @@ public class BasicAction extends StateManager
            */
 
         if (actionType == ActionType.TOP_LEVEL)
-            actionStatus = preparedStatus();
+            this.actionStatus = preparedStatus();
         else
-            actionStatus = ActionStatus.PREPARED;
+            this.actionStatus = ActionStatus.PREPARED;
 
         /*
            * If we are here then everything went okay so save the intention list
@@ -2351,13 +2375,21 @@ public class BasicAction extends StateManager
 
         /* Are we forced to abort? */
 
-        if (actionStatus == ActionStatus.ABORT_ONLY) {
-            tsLogger.i18NLogger.warn_coordinator_BasicAction_43(get_uid());
+        /*
+         * We must perform the check atomically, so we don't fail to notice ABORT_ONLY being set, else the caller
+         * of #preventCommit() will see a successful result yet the transaction will commit.
+         */
+        int actionStatus;
+        do {
+            actionStatus = this.actionStatus;
+            if (actionStatus == ActionStatus.ABORT_ONLY) {
+                tsLogger.i18NLogger.warn_coordinator_BasicAction_43(get_uid());
 
-            Abort();
+                Abort();
 
-            return;
-        }
+                return;
+            }
+        } while (! actionStatusUpdater.compareAndSet(this, actionStatus, ActionStatus.COMMITTING));
 
         Long startTime = TxStats.enabled() ? System.nanoTime() : null;
 
@@ -3730,7 +3762,14 @@ public class BasicAction extends StateManager
 
     /* Atomic action status variables */
 
-    private int actionStatus;
+    /**
+     * The action status.  This field must only be updated under the instance's lock, with the single
+     * exception of any updates which <em>enter</em> the {@link ActionStatus#RUNNING} or {@link ActionStatus#ABORT_ONLY}
+     * states or are executed in the constructor.  Additionally, any updates which <em>exit</em> these two states
+     * <em>and</em> depend on knowing which of these values was set at the time of exit <em>must</em> update atomically
+     * by way of {@link #actionStatusUpdater}.
+     */
+    private volatile int actionStatus;
     private int actionType;
     private BasicAction parentAction;
     private AbstractRecord recordBeingHandled;
@@ -3754,6 +3793,7 @@ public class BasicAction extends StateManager
     //    private Mutex _lock = new Mutex(); // TODO
     private List<Throwable> deferredThrowables = new ArrayList<>();
     
+    private static final AtomicIntegerFieldUpdater<BasicAction> actionStatusUpdater = AtomicIntegerFieldUpdater.newUpdater(BasicAction.class, "actionStatus");
 }
 
 class BasicActionFinalizer
